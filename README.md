@@ -1,15 +1,16 @@
 # hdpdev
 
+Container for hadoop software test
 
 Obs: 
-- privileged √© necess√°rio por causa do systemd
-- Container foi instalado com o hostname horton.single.node
-- Portas para exposi√√o 8080 = Ambari
-  Colocar as demais portas se necess√rio
+- Use [--privileged]  to allow ambari-server initialization inside container via systemd
+- Use [-h horton.single.node]. Hadoop was installed using that hostname
+- Remember to export ports for access . (e.g -p 8080:8080) 
 
+## Examples
 
-#Ex: Para iniciar o container
-docker --name horton -d --privileged -h horton.single.node -p 8080:8080 horton
+### Start container and export ambari port
+docker --name hdp -d --privileged -h horton.single.node -p 8080:8080 gracig/hdpdev:v0.0.1
 
-#Ex: Para executar comandos dentro do container
-docker exec -it horton bash
+### Get a shell inside container
+docker exec -it hdp bash
