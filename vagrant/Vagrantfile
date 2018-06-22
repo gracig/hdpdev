@@ -1,0 +1,192 @@
+Vagrant.configure("2") do |config|
+
+  # Obtendo máquina virtual centos/7 padrão
+  config.vm.box = "centos/7"
+  
+  # Configura a VM
+  config.vm.provider "virtualbox" do |vb|
+    vb.gui = false
+    vb.memory = "6144"  
+  end
+
+  # script de provisionamento da VM
+  config.vm.provision "shell", inline: <<-SHELL
+    # Se ocorrer qualquer erro o script termina com falha
+    set -e 
+    #Repete os comandos executados
+    set -x
+
+    # Define variaveis que serão usadas nesse script
+    export HOSTNAME=hdp262.dell.local
+    export IP=`ip address | grep eth0$ | awk '{print $2}' | cut -d/ -f1`
+    export AMBARIUSER=ambari
+    export AMBARIPASSWORD=ambari
+    export AMBARIDATABASE=ambari_db
+    export AMBARISCHEMA=ambari_schema
+    export PGPASSWORD=$AMBARIPASSWORD
+    export HIVEUSER=hive
+    export HIVEDATABASE=hive_db
+    export HIVEPASSWORD=hive
+    
+    # Configura o hostname da maquina virtual
+    echo $HOSTNAME > /etc/hostname
+    hostname $HOSTNAME
+    cat >  /etc/sysconfig/network <<CFG
+      NETWORKING=yes
+      HOSTNAME=$HOSTNAME
+CFG
+
+    # Configura o arquivo de hosts
+    grep -v $HOSTNAME /etc/hosts > /tmp/hosts
+    echo "$IP   $HOSTNAME" >> /tmp/hosts
+    cp -f /tmp/hosts /etc/hosts
+
+    #Cria uma chave SSH para o usuario root para acesso automatico
+    cat /dev/zero | ssh-keygen -q -N "" > /dev/null || /bin/true
+    cat  ~/.ssh/id_rsa.pub > ~/.ssh/authorized_keys
+    ssh -oStrictHostKeyChecking=no root@localhost ls
+    ssh -oStrictHostKeyChecking=no root@$HOSTNAME ls
+        
+    #Desabilita o SELinux
+    sed -i 's/^SELINUX=.*/SELINUX=disabled/g' /etc/selinux/config
+    setenforce 0
+
+    #Configura limite de numero de arquivos para o usuario
+    cat > /etc/security/limits.conf <<CFG
+*    soft    nofile 10000
+*    hard    nofile 10000
+CFG
+    ulimit -n 10000
+
+    #Copiado do docker, Prepara o sistema para a instalação do system.d   
+    (cd /lib/systemd/system/sysinit.target.wants/; for i in *; do [ $i == systemd-tmpfiles-setup.service ] || rm -f $i; done);
+    rm -f /lib/systemd/system/multi-user.target.wants/*;
+    rm -f /etc/systemd/system/*.wants/*;
+    rm -f /lib/systemd/system/local-fs.target.wants/*; 
+    rm -f /lib/systemd/system/sockets.target.wants/*udev*; 
+    rm -f /lib/systemd/system/sockets.target.wants/*initctl*; 
+    rm -f /lib/systemd/system/basic.target.wants/*;
+    rm -f /lib/systemd/system/anaconda.target.wants/*;
+
+    #Faz a instalação dos pacotes necessários
+    yum install epel-release -y 
+    yum update -y
+    yum install -y scp curl unzip tar wget python27 
+    yum install -y yum-utils yum-plugin-ovl git bind-utils
+    yum install -y openssh-server openssh-clients
+    yum install -y krb5-workstation vim initscripts htop systemd*
+    yum install -y ntp
+
+    #Instala o utilitario jq (Json Query)
+    curl -o /usr/bin/jq http://stedolan.github.io/jq/download/linux64/jq && chmod +x /usr/bin/jq
+
+    #Habilita serviços 
+    systemctl enable sshd
+    systemctl enable ntpd
+
+    #Desabilita firewall
+    systemctl disable firewalld
+    service firewalld stop
+ 
+    #Instala o banco de dados postgres
+    yum install -y postgresql-server postgresql-contrib postgresql-jdbc*
+    postgresql-setup initdb || /bin/true
+    systemctl enable postgresql
+    #Configura acesso para o banco de dados postgres
+    sed -i "s/#listen_addresses.*/listen_addresses = '*'/g" /var/lib/pgsql/data/postgresql.conf
+    sed -i 's/#port = 5432.*/port = 5432/g' /var/lib/pgsql/data/postgresql.conf
+    sed -i 's|host.*all.*all.*127.0.0.1/32.*ident|host all all 0.0.0.0/0 trust|g' /var/lib/pgsql/data/pg_hba.conf
+    sed -i 's|local.*all.*all.*peer|local all all trust|g' /var/lib/pgsql/data/pg_hba.conf
+    #Inicia o banco de dados postgres
+    systemctl start postgresql
+
+    #Configura o repositorio do ambari para o yum
+    wget -nv http://public-repo-1.hortonworks.com/ambari/centos6/2.x/updates/2.5.2.0/ambari.repo -O /etc/yum.repos.d/ambari.repo
+    wget -nv http://public-repo-1.hortonworks.com/HDP/centos6/2.x/updates/2.6.2.14/hdp.repo -O /etc/yum.repos.d/hdp.repo
+    yum update -y
+
+    #Instala o agente do ambari
+    yum install -y ambari-agent    
+    sed -i "s/hostname=localhost/hostname=$HOSTNAME/g" /etc/ambari-agent/conf/ambari-agent.ini
+    systemctl restart ambari-agent
+
+    #Instala o servidor do Ambari
+    yum install -y ambari-server
+
+    #Configura o schema no banco de dados postgres
+    cat > /tmp/ambari_schema.sql <<SQL
+        CREATE DATABASE $AMBARIDATABASE;
+        CREATE USER $AMBARIUSER WITH PASSWORD '$AMBARIPASSWORD';
+        GRANT ALL PRIVILEGES ON DATABASE $AMBARIDATABASE TO $AMBARIUSER;
+        \\connect $AMBARIDATABASE;
+        CREATE SCHEMA $AMBARISCHEMA AUTHORIZATION $AMBARIUSER;
+        ALTER SCHEMA $AMBARISCHEMA OWNER TO $AMBARIUSER;
+        ALTER ROLE $AMBARIUSER SET search_path to '$AMBARISCHEMA', 'public';
+SQL
+    RETRIES=10
+    until sudo -u postgres psql  -f /tmp/ambari_schema.sql  || [ $RETRIES -eq 0 ]; do
+        echo "Waiting for postgres server, $((RETRIES--)) remaining attempts..."
+        sleep 1
+    done
+    psql -U $AMBARIUSER -d $AMBARIDATABASE -c '\\i /var/lib/ambari-server/resources/Ambari-DDL-Postgres-CREATE.sql;'
+    
+    #Configura o servidor ambari com os parametros de acesso para o banco de dados
+    ambari-server setup -s --database=postgres --databasehost=$HOSTNAME --databaseport=5432 --databasename=$AMBARIDATABASE \
+    --postgresschema=$AMBARISCHEMA  --databaseusername=$AMBARIUSER --databasepassword=$AMBARIPASSWORD
+    
+    #Configura timeout para start do servico do ambari
+    grep server.startup.web.timeout /etc/ambari-server/conf/ambari.properties || echo server.startup.web.timeout=180 >> /etc/ambari-server/conf/ambari.properties
+
+    #Inicia o serviço do servidor ambari
+    ambari-server start
+
+    #Verifica o status do serviço do servidor
+    sleep 300
+    ambari-server status
+    
+    #Configura o banco de dados para o Hive metastore
+    echo "CREATE DATABASE $HIVEDATABASE;" | psql -U postgres
+    echo "CREATE USER $HIVEUSER WITH PASSWORD '$HIVEPASSWORD';" | psql -U postgres
+    echo "GRANT ALL PRIVILEGES ON DATABASE $HIVEDATABASE TO $HIVEUSER;" | psql -U postgres
+    #Configura o driver jdbc postgres para uso pelo Ambari
+    ambari-server setup --jdbc-db=postgres --jdbc-driver=/usr/share/java/postgresql-jdbc.jar > ambari-server.log 2>&1
+
+
+    #Criar e evnia arquivo de versões do HDP
+    tee versiondefinitions.json <<CFG
+    {
+      "VersionDefinition": {
+        "version_url":"http://public-repo-1.hortonworks.com/HDP/centos6/2.x/updates/2.6.2.14/HDP-2.6.2.14-5.xml"
+      }
+    }
+CFG
+    curl -H "X-Requested-By: ambari" -X POST -u admin:admin http://$HOSTNAME:8080/api/v1/version_definitions  -d @versiondefinitions.json
+    
+
+    #Substitui hostname no arquivo de propriedade do HIVE (Bug do blueprint)
+    sed -i "s/%HOSTGROUP::host_group_1%/$HOSTNAME/g" /vagrant/blueprints/cluster_configuration.json
+
+    #Envia as configurações de blueprint para o servidor
+    curl -H "X-Requested-By: ambari" -X POST -u admin:admin http://$HOSTNAME:8080/api/v1/blueprints/singlenode -d @/vagrant/blueprints/cluster_configuration.json
+
+    #Executa o Blueprint
+    tee hostmapping.json <<CFG
+    {
+      "blueprint" : "singlenode",
+      "default_password" : "admin",
+      "repository_version" : "2.6.2.14-5",
+      "host_groups" : [
+        {
+            "name" : "host_group_1",
+            "hosts" : [
+                { "fqdn" : "$HOSTNAME" }
+            ]
+        }
+      ]
+    }
+CFG
+    curl -H "X-Requested-By: ambari" -X POST -u admin:admin http://$HOSTNAME:8080/api/v1/clusters/singlenode -d @hostmapping.json
+
+SHELL
+  
+end
