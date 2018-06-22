@@ -1,6 +1,6 @@
 # hdpdev
 
-Container for hadoop software test
+Container for hadoop software tests
 
 Obs: 
 - Use [--privileged]  to allow ambari-server initialization inside container via systemd
